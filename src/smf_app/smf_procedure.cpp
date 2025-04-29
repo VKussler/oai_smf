@@ -717,6 +717,10 @@ smf_procedure_code session_create_sm_context_procedure::run(
     const std::shared_ptr<itti_n11_create_sm_context_request>& sm_context_req,
     const std::shared_ptr<itti_n11_create_sm_context_response>& sm_context_resp,
     std::shared_ptr<smf::smf_context> sc) {
+  m_ctx           = sc;
+  m_create_sm_req = sm_context_req;
+  m_create_sm_rsp = sm_context_resp;
+
   Logger::smf_app().info("Perform a procedure - Create SM Context Request");
   // TODO check if compatible with ongoing procedures if any
   std::shared_ptr<upf_graph> graph = {};
@@ -973,12 +977,15 @@ smf_procedure_code session_update_sm_context_procedure::run(
     const std::shared_ptr<itti_n11_update_sm_context_request>& sm_context_req,
     std::shared_ptr<itti_n11_update_sm_context_response> sm_context_resp,
     const std::shared_ptr<smf::smf_context>& sc) {
-  // Handle SM update sm context request
-  // The SMF initiates an N4 Session Modification procedure with the UPF. The
-  // SMF provides AN Tunnel Info to the UPF as well as the corresponding
-  // forwarding rules
+  m_ctx           = sc;
+  m_update_sm_req = sm_context_req;
+  m_update_sm_rsp = sm_context_resp;
 
-  bool send_n4 = false;
+  // Declare edge update vectors here
+  std::vector<std::shared_ptr<qos_upf_edge>> dl_edges_to_update;
+  std::vector<std::shared_ptr<qos_upf_edge>> ul_edges_to_update;
+  bool send_n4 = false; // Declare send_n4 here as well
+
   Logger::smf_app().info("Perform a procedure - Update SM Context Request");
   // TODO check if compatible with ongoing procedures if any
   // Get UPF node
@@ -1008,25 +1015,21 @@ smf_procedure_code session_update_sm_context_procedure::run(
   }
 
   std::shared_ptr<upf_graph> graph =
-      sps->get_session_handler()->get_session_graph();
+      sp->get_session_handler()->get_session_graph();
 
   if (!graph) {
     Logger::smf_app().warn("PDU session does not have a UPF association");
     return smf_procedure_code::ERROR;
   }
-
-  //  TODO: UPF insertion in case of Handover
-
+  // we start from the access nodes, because we have only ULCLs we don't have
+  // the situation that one UPF is returned more than once
   graph->start_asynch_dfs_procedure(false);
 
-  std::shared_ptr<pfcp_association> current_upf = {};
   std::vector<std::shared_ptr<qos_upf_edge>> dl_edges;
   std::vector<std::shared_ptr<qos_upf_edge>> ul_edges;
-  std::vector<std::shared_ptr<qos_upf_edge>> dl_edges_to_update;
-  std::vector<std::shared_ptr<qos_upf_edge>> ul_edges_to_update;
-
-  if (get_next_upf(dl_edges, ul_edges, current_upf) !=
-      smf_procedure_code::CONTINUE) {
+  std::shared_ptr<pfcp_association> current_upf = {};
+  if (get_next_upf(dl_edges, ul_edges, current_upf) ==
+      smf_procedure_code::ERROR) {
     Logger::smf_app().error("DL Procedure Error: No UPF to select");
     return smf_procedure_code::ERROR;
   }
@@ -1132,6 +1135,8 @@ smf_procedure_code session_update_sm_context_procedure::run(
 
     case session_management_procedures_type_e::
         SERVICE_REQUEST_UE_TRIGGERED_STEP2: {
+      Logger::smf_app().debug("SERVICE_REQUEST_UE_TRIGGERED_STEP2");
+
       // here we only have to update first UPF, as we get new F-TEID from gNB,
       // basically just make new PDRs / FARs in DL
       for (const auto& dl_edge : dl_edges) {

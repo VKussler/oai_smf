@@ -66,6 +66,10 @@
 #include "smf_sbi.hpp"
 #include "string.hpp"
 
+#include "smf_context.hpp"
+#include <vector> // Include vector
+#include <tuple> // Include tuple
+
 extern "C" {
 #include "dynamic_memory_check.h"
 #include "nas_message.h"
@@ -2412,3 +2416,101 @@ void smf_app::trigger_upf_status_notification_subscribe() {
 std::string smf_app::get_smf_instance_id() const {
   return smf_instance_id;
 }
+
+void smf_app::trigger_dnn_updates(const std::map<std::string, oai::config::smf::DnnChange>& dnn_changes) {
+    Logger::smf_app().debug("Entering trigger_dnn_updates().");
+    Logger::smf_app().info("Processing detected DNN configuration changes.");
+
+    // --- Collect affected sessions --- 
+    // Store info for sessions to be released {SUPI, PDU ID, DNN, S-NSSAI, ChangeType}
+    std::vector<std::tuple<supi_t, pdu_session_id_t, std::string, snssai_t, oai::config::smf::DnnChange>> sessions_to_release;
+    // Modification list is no longer needed as MODIFIED also triggers release
+    // std::vector<std::tuple<supi_t, pdu_session_id_t, std::string, snssai_t, seid_t>> sessions_to_modify;
+
+    {
+        std::shared_lock seid_lock(m_seid2smf_context);
+        for (const auto& [seid, context_ptr] : seid2smf_context) {
+            if (!context_ptr) continue;
+
+            std::shared_ptr<smf_context> sc = context_ptr;
+            // REMOVED: std::shared_lock pdu_lock(sc->m_pdu_sessions_mutex); // Incorrect access to private member
+
+            std::map<pdu_session_id_t, std::shared_ptr<smf_pdu_session>> pdu_sessions_copy;
+            sc->get_pdu_sessions(pdu_sessions_copy); // This method should handle locking
+
+            for (const auto& [pdu_id, session_ptr] : pdu_sessions_copy) {
+                if (!session_ptr) continue;
+
+                std::string session_dnn = session_ptr->get_dnn();
+                auto it = dnn_changes.find(session_dnn);
+
+                if (it != dnn_changes.end()) {
+                    oai::config::smf::DnnChange change_type = it->second;
+                    switch (change_type) {
+                        case oai::config::smf::DnnChange::ADDED:
+                            // No action on existing sessions
+                            break; 
+                        case oai::config::smf::DnnChange::REMOVED:
+                            Logger::smf_app().warn("Session (SUPI: %s, PDU ID: %d) uses DNN '%s' which was REMOVED. Marking for release.",
+                                                   smf_supi_to_string(sc->get_supi()).c_str(), pdu_id, session_dnn.c_str()); // Use helper function
+                            sessions_to_release.emplace_back(sc->get_supi(), pdu_id, session_dnn, session_ptr->get_snssai(), change_type);
+                            break;
+                        case oai::config::smf::DnnChange::MODIFIED:
+                             Logger::smf_app().warn("Session (SUPI: %s, PDU ID: %d) uses DNN '%s' which was MODIFIED. Releasing session as automated update is not supported.",
+                                                   smf_supi_to_string(sc->get_supi()).c_str(), pdu_id, session_dnn.c_str()); // Use helper function
+                             // Trigger release for modified DNNs as well
+                             sessions_to_release.emplace_back(sc->get_supi(), pdu_id, session_dnn, session_ptr->get_snssai(), change_type);
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Trigger release for collected sessions --- 
+    if (!sessions_to_release.empty()) {
+         unsigned int release_count_removed = 0;
+         unsigned int release_count_modified = 0;
+         for (const auto& session_info : sessions_to_release) {
+            if (std::get<4>(session_info) == oai::config::smf::DnnChange::REMOVED) release_count_removed++;
+            else release_count_modified++;
+         }
+         Logger::smf_app().info("Triggering release for %u sessions (Removed: %u, Modified: %u).", 
+                              sessions_to_release.size(), release_count_removed, release_count_modified);
+         
+         for (const auto& session_info : sessions_to_release) {
+            // Unpack the tuple including the change type
+            const auto& [supi, pdu_id, dnn, snssai, reason] = session_info;
+            const char* reason_str = (reason == oai::config::smf::DnnChange::REMOVED) ? "REMOVED" : "MODIFIED";
+
+            Logger::smf_app().info("--> Triggering release procedure for SUPI: %s, PDU ID: %d, DNN: %s (Reason: DNN %s)",
+                                   smf_supi_to_string(supi).c_str(), pdu_id, dnn.c_str(), reason_str);
+
+            // Construct and send itti_n11_release_sm_context_request internally
+            // Revert constructor call
+            // Use constructor with promise_id = 0 for internal trigger
+            auto release_req_msg = std::make_shared<itti_n11_release_sm_context_request>(TASK_SMF_APP, TASK_SMF_APP, 0);
+
+            release_req_msg->req.set_supi(supi);
+            release_req_msg->req.set_pdu_session_id(pdu_id);
+            release_req_msg->req.set_dnn(dnn);
+            release_req_msg->req.set_snssai(snssai);
+
+            // Cause values are not set here as the request object does not have these members.
+            // The release cause (e.g., cause_value_5gsm_e) is determined later.
+
+            release_req_msg->pid = 0; // No promise for internal trigger
+            release_req_msg->http_version = smf_cfg->http_version; // Needs `smf_cfg` global/member
+
+            int ret = itti_inst->send_msg(release_req_msg);
+            if (RETURNok != ret) {
+                Logger::smf_app().error("Failed to send internal release ITTI message for SUPI %s, PDU ID %d", smf_supi_to_string(supi).c_str(), pdu_id);
+            }
+         }
+    }
+
+    // Modification logic is removed as MODIFIED triggers release now.
+    Logger::smf_app().debug("Exiting trigger_dnn_updates().");
+}
+
+//} // namespace smf

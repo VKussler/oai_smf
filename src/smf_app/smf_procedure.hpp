@@ -219,6 +219,14 @@ class session_create_sm_context_procedure : public smf_session_procedure {
    * @return
    */
   smf_procedure_code send_n4_session_establishment_request();
+
+ private:
+  // Declare missing members
+  std::shared_ptr<smf_context> m_ctx;
+  std::shared_ptr<itti_n11_create_sm_context_request> m_create_sm_req;
+  std::shared_ptr<itti_n11_create_sm_context_response> m_create_sm_rsp;
+  std::shared_ptr<itti_n11_update_sm_context_request> m_update_sm_req;
+  std::shared_ptr<itti_n11_update_sm_context_response> m_update_sm_rsp;
 };
 
 //------------------------------------------------------------------------------
@@ -261,11 +269,11 @@ class session_update_sm_context_procedure : public smf_session_procedure {
   session_management_procedures_type_e session_procedure_type;
 
  private:
-  /**
-   * Sends a session modification request, based on the graph
-   * Does only consider normal DL procedures
-   * @return OK when successful, ERROR otherwise
-   */
+  // Declare missing members
+  std::shared_ptr<smf_context> m_ctx;
+  std::shared_ptr<itti_n11_update_sm_context_request> m_update_sm_req;
+  std::shared_ptr<itti_n11_update_sm_context_response> m_update_sm_rsp;
+
   smf_procedure_code send_n4_session_modification_request(
       const std::vector<pfcp::qfi_t>& list_of_qfis);
 
@@ -313,6 +321,11 @@ class session_release_sm_context_procedure : public smf_session_procedure {
   session_management_procedures_type_e session_procedure_type;
 
  private:
+  // Declare missing members
+  std::shared_ptr<smf_context> m_ctx;
+  std::shared_ptr<itti_n11_release_sm_context_request> m_release_sm_req; // Assuming this is the correct type based on usage
+  std::shared_ptr<itti_n11_release_sm_context_response> m_release_sm_rsp; // Assuming this is the correct type based on usage
+
   smf_procedure_code send_n4_session_deletion_request();
 };
 

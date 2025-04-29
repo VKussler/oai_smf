@@ -46,8 +46,12 @@
 #include "smf_config_types.hpp"
 #include "if.hpp"
 #include "Snssai.h"
+#include <spdlog/spdlog.h>
 
 namespace oai::config::smf {
+
+// Enum to classify changes to DNN configuration
+enum class DnnChange { ADDED, REMOVED, MODIFIED };
 
 const std::string USE_LOCAL_PCC_RULES_CONFIG_VALUE = "use_local_pcc_rules";
 const std::string USE_LOCAL_SUBSCRIPTION_INFOS_CONFIG_VALUE =
@@ -166,6 +170,8 @@ class smf_config : public config {
   // all the calling classes
   void to_smf_config();
 
+  mutable std::mutex dnn_mutex;
+
   void update_used_nfs() override;
 
  public:
@@ -208,6 +214,11 @@ class smf_config : public config {
   const ue_dns& get_dns_from_dnn(const std::string& dnn);
 
   bool init() override;
+
+  // Attempts to reload configuration from the original file path.
+  // Returns a map indicating changed DNNs (key: dnn string, value: DnnChange enum).
+  // An empty map indicates failure or no DNN changes requiring propagation.
+  std::map<std::string, DnnChange> reload_config();
 
   /*
    * Represent SMF's config as json object

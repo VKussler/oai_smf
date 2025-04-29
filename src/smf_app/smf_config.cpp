@@ -146,6 +146,7 @@ int smf_config::get_pfcp_fseid(pfcp::fseid_t& fseid) {
 //------------------------------------------------------------------------------
 bool smf_config::is_dotted_dnn_handled(
     const std::string& dnn, const pdu_session_type_t& pdn_session_type) {
+  std::lock_guard<std::mutex> lock(dnn_mutex); // Lock for reading dnns map
   Logger::smf_app().debug("Requested DNN: %s", dnn.c_str());
 
   for (const auto& it : dnns) {
@@ -169,6 +170,7 @@ bool smf_config::is_dotted_dnn_handled(
 
 //------------------------------------------------------------------------------
 std::string smf_config::get_default_dnn() {
+  std::lock_guard<std::mutex> lock(dnn_mutex); // Lock for reading dnns map
   for (const auto& it : dnns) {
     Logger::smf_app().debug("Default DNN: %s", it.second.dnn.c_str());
     return it.second.dnn;
@@ -215,25 +217,29 @@ void smf_config::to_smf_config() {
   http_version    = get_http_version();
 
   // DNNs
-  for (const auto& cfg_dnn : get_dnns()) {
-    dnn_t dnn;
-    dnn.pdu_session_type  = cfg_dnn.get_pdu_session_type();
-    dnn.dnn               = cfg_dnn.get_dnn();
-    dnn.ue_pool_range_low = cfg_dnn.get_ipv4_pool_start();
-    // we need to add one IP as it is reserved for the GW
-    dnn.ue_pool_range_low.s_addr += be32toh(1);
-    dnn.ue_pool_range_high = cfg_dnn.get_ipv4_pool_end();
+  {
+    std::lock_guard<std::mutex> lock(dnn_mutex); // Lock before accessing dnns map
+    dnns.clear(); // Clear the map before repopulating
+    for (const auto& cfg_dnn : get_dnns()) {
+      dnn_t dnn;
+      dnn.pdu_session_type  = cfg_dnn.get_pdu_session_type();
+      dnn.dnn               = cfg_dnn.get_dnn();
+      dnn.ue_pool_range_low = cfg_dnn.get_ipv4_pool_start();
+      // we need to add one IP as it is reserved for the GW
+      dnn.ue_pool_range_low.s_addr += be32toh(1);
+      dnn.ue_pool_range_high = cfg_dnn.get_ipv4_pool_end();
 
-    logger::logger_registry::get_logger(LOGGER_NAME)
-        .debug(
-            "DNN %s: -- First UE IPv4: %s -- Last UE IPv4: %s", dnn.dnn,
-            conv::toString(dnn.ue_pool_range_low),
-            conv::toString(dnn.ue_pool_range_high));
+      logger::logger_registry::get_logger(LOGGER_NAME)
+          .debug(
+              "DNN %s: -- First UE IPv4: %s -- Last UE IPv4: %s", dnn.dnn,
+              conv::toString(dnn.ue_pool_range_low),
+              conv::toString(dnn.ue_pool_range_high));
 
-    dnn.paa_pool6_prefix     = cfg_dnn.get_ipv6_prefix();
-    dnn.paa_pool6_prefix_len = cfg_dnn.get_ipv6_prefix_length();
-    dnns[dnn.dnn]            = dnn;
-  }
+      dnn.paa_pool6_prefix     = cfg_dnn.get_ipv6_prefix();
+      dnn.paa_pool6_prefix_len = cfg_dnn.get_ipv6_prefix_length();
+      dnns[dnn.dnn]            = dnn;
+    }
+  } // Mutex is automatically unlocked here
 }
 
 bool smf_config::init() {
@@ -254,6 +260,80 @@ bool smf_config::init() {
   }
 
   return success;
+}
+
+std::map<std::string, DnnChange> smf_config::reload_config() {
+    Logger::smf_app().debug("Entering reload_config().");
+    Logger::smf_app().info("Attempting to reload configuration from %s", get_config_path().c_str());
+    std::map<std::string, DnnChange> dnn_changes;
+    std::map<std::string, dnn_t> old_dnns;
+
+    // --- Create a copy of the current DNN map (needs mutex protection) ---
+    {
+        std::lock_guard<std::mutex> lock(dnn_mutex);
+        old_dnns = dnns; // Make a copy
+    }
+
+    // --- Re-run the base class initialization (parses file) ---
+    if (!config::init()) {
+        Logger::smf_app().error("Failed to re-initialize base configuration during reload.");
+        return {}; // Return empty map on failure
+    }
+
+    // --- Re-populate derived class members (updates internal dnns map) ---
+    try {
+      // to_smf_config already locks dnn_mutex internally for writing
+      to_smf_config();
+    } catch (const std::exception& e) {
+      Logger::smf_app().error("Exception during configuration mapping in reload: %s", e.what());
+      // Config might be inconsistent, don't report changes. Reload failed effectively.
+      // TODO: Consider reverting to old_dnns state?
+      return {}; // Return empty map on failure
+    }
+
+    // --- Compare old and new DNN maps (needs mutex protection for reading new map) ---
+    {
+        std::lock_guard<std::mutex> lock(dnn_mutex);
+        // Check for removed or modified DNNs
+        for (const auto& [dnn_name, old_dnn_data] : old_dnns) {
+            auto it = dnns.find(dnn_name);
+            if (it == dnns.end()) {
+                // DNN was removed
+                dnn_changes[dnn_name] = DnnChange::REMOVED;
+                Logger::smf_app().warn("Detected REMOVED DNN: %s", dnn_name.c_str());
+            } else {
+                // DNN exists, check if modified (simple check: compare UE pool ranges)
+                // TODO: Define a proper comparison operator or function for dnn_t if more detailed checks are needed.
+                if (it->second.ue_pool_range_low.s_addr != old_dnn_data.ue_pool_range_low.s_addr ||
+                    it->second.ue_pool_range_high.s_addr != old_dnn_data.ue_pool_range_high.s_addr ||
+                    memcmp(&it->second.paa_pool6_prefix, &old_dnn_data.paa_pool6_prefix, sizeof(in6_addr)) != 0
+                    /* || add other relevant field comparisons here */
+                    ) {
+                    dnn_changes[dnn_name] = DnnChange::MODIFIED;
+                     Logger::smf_app().warn("Detected MODIFIED DNN: %s", dnn_name.c_str());
+                     // Add DEBUG log showing specific changes (e.g., IP pools)
+                     Logger::smf_app().debug("  - Old IPv4 Pool: %s - %s", conv::toString(old_dnn_data.ue_pool_range_low).c_str(), conv::toString(old_dnn_data.ue_pool_range_high).c_str());
+                     Logger::smf_app().debug("  - New IPv4 Pool: %s - %s", conv::toString(it->second.ue_pool_range_low).c_str(), conv::toString(it->second.ue_pool_range_high).c_str());
+                     // TODO: Add logging for IPv6 pool changes if relevant
+                }
+            }
+        }
+
+        // Check for added DNNs
+        for (const auto& [dnn_name, new_dnn_data] : dnns) {
+            if (old_dnns.find(dnn_name) == old_dnns.end()) {
+                dnn_changes[dnn_name] = DnnChange::ADDED;
+                 Logger::smf_app().warn("Detected ADDED DNN: %s", dnn_name.c_str());
+            }
+        }
+    }
+
+    Logger::smf_app().info("Successfully reloaded configuration. %ld DNN changes detected needing action.", dnn_changes.size());
+    Logger::smf_app().debug("Exiting reload_config().");
+
+    // Actual application of log level etc. happens in the caller (handle_config_change)
+    // Return the map of detected DNN changes for the caller to handle propagation
+    return dnn_changes;
 }
 
 std::shared_ptr<smf_config_type> smf_config::smf() const {

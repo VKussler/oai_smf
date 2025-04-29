@@ -1,0 +1,2 @@
+/usr/bin/ar qc libCN_UTILS.a CMakeFiles/CN_UTILS.dir/3gpp_conversions.cpp.o CMakeFiles/CN_UTILS.dir/async_shell_cmd.cpp.o CMakeFiles/CN_UTILS.dir/epc.cpp.o CMakeFiles/CN_UTILS.dir/thread_sched.cpp.o CMakeFiles/CN_UTILS.dir/mime_parser.cpp.o CMakeFiles/CN_UTILS.dir/fqdn.cpp.o
+/usr/bin/ranlib libCN_UTILS.a

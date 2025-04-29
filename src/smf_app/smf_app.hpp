@@ -51,6 +51,7 @@
 #include "smf_pco.hpp"
 #include "smf_profile.hpp"
 #include "smf_subscription.hpp"
+#include "smf_config.hpp"
 
 namespace smf {
 
@@ -980,6 +981,14 @@ class smf_app {
    * @return SMF instance ID
    */
   std::string get_smf_instance_id() const;
+
+  /**
+   * @brief Triggers updates for active PDU sessions based on detected DNN configuration changes.
+   *
+   * @param dnn_changes A map where the key is the DNN string and the value indicates
+   *                    if the DNN was ADDED, REMOVED, or MODIFIED.
+   */
+  void trigger_dnn_updates(const std::map<std::string, oai::config::smf::DnnChange>& dnn_changes);
 };
 }  // namespace smf
 #include "smf_config.hpp"
