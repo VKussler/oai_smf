@@ -9,10 +9,12 @@
 #include <atomic>
 #include <errno.h> // Include for strerror
 #include <map>
+#include <libgen.h> // For dirname
+#include <vector>   // For storing directory path string
 
 #include "../common/logger.hpp" // Corrected include path
-#include "smf_app/smf_config.hpp" // Include smf_config definition
-#include "smf_app/smf_app.hpp" // Include smf_app definition for trigger function
+#include "smf_config.hpp" // Corrected include path - removed smf_app/
+#include "smf_app.hpp" // Corrected include path - removed smf_app/
 
 // Access the global smf_app instance (declared in main.cpp)
 extern smf::smf_app* smf_app_inst;
@@ -24,15 +26,30 @@ namespace oai::config {
 
 static pthread_t monitor_thread_id;
 static std::string monitored_file_path;
+static std::string monitored_dir_path;
+static std::string monitored_filename;
 static std::atomic<oai::config::smf::smf_config*> smf_config_instance = {nullptr}; // Store the instance pointer
 
 // Thread function to monitor the file
 static void* monitor_file(void* arg) {
+    Logger::smf_app().info("monitor_file thread started.");
     int fd = -1;
     int wd = -1;
     char buffer[BUF_LEN];
 
-    Logger::smf_app().info("Starting configuration file monitor thread for: %s", monitored_file_path.c_str());
+    // Extract directory path and filename
+    std::vector<char> file_path_vec(monitored_file_path.begin(), monitored_file_path.end());
+    file_path_vec.push_back('\0'); // Null-terminate for dirname/basename
+    char* dir_path_cstr = dirname(file_path_vec.data());
+    monitored_dir_path = std::string(dir_path_cstr);
+    // Need to copy again for basename as dirname might modify the input string
+    std::vector<char> file_path_vec_copy(monitored_file_path.begin(), monitored_file_path.end());
+    file_path_vec_copy.push_back('\0');
+    char* filename_cstr = basename(file_path_vec_copy.data());
+    monitored_filename = std::string(filename_cstr);
+
+    Logger::smf_app().info("Starting configuration directory monitor thread for directory: %s, watching for file: %s", 
+                         monitored_dir_path.c_str(), monitored_filename.c_str());
 
     fd = inotify_init1(IN_NONBLOCK);
     if (fd < 0) {
@@ -40,16 +57,23 @@ static void* monitor_file(void* arg) {
         return nullptr;
     }
 
-    wd = inotify_add_watch(fd, monitored_file_path.c_str(), IN_MODIFY | IN_CLOSE_WRITE);
+    // Watch the DIRECTORY for relevant events
+    // IN_CREATE: Catches creation of ..data temp dir/file
+    // IN_MOVED_TO: Catches the atomic symlink update
+    // IN_CLOSE_WRITE: Might catch direct writes if symlink isn't used
+    Logger::smf_app().debug("Attempting to add inotify watch for directory: %s", monitored_dir_path.c_str());
+    wd = inotify_add_watch(fd, monitored_dir_path.c_str(), 
+                           IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE);
     if (wd < 0) {
-        Logger::smf_app().error("inotify_add_watch failed for %s: %s", monitored_file_path.c_str(), strerror(errno));
+        Logger::smf_app().error("inotify_add_watch failed for directory %s: %s", monitored_dir_path.c_str(), strerror(errno));
         close(fd);
         return nullptr;
     }
 
-    Logger::smf_app().debug("inotify watch added for file: %s (wd=%d)", monitored_file_path.c_str(), wd);
+    Logger::smf_app().debug("inotify watch added successfully for directory: %s (wd=%d)", monitored_dir_path.c_str(), wd);
 
     while (true) { // Loop indefinitely (or until thread cancellation is implemented)
+        Logger::smf_app().trace("monitor_file loop: Waiting for inotify events...");
         int length = read(fd, buffer, BUF_LEN);
 
         if (length < 0) {
@@ -70,17 +94,48 @@ static void* monitor_file(void* arg) {
                  // We are watching a file, not a directory, so name is not expected/needed
             }
 
-            if (event->mask & IN_MODIFY || event->mask & IN_CLOSE_WRITE) {
-                Logger::smf_app().info("Detected modification or close_write on configuration file: %s", monitored_file_path.c_str());
+            // We are watching a directory now
+            // Only trigger reload if the event pertains to our specific config file
+            // or the special ..data directory Kubernetes uses for atomic updates.
+            std::string event_filename = (event->len > 0) ? event->name : "";
+            bool trigger_reload = false;
+
+            if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE)) {
+                if (event_filename == monitored_filename || 
+                    event_filename == "..data" ||          // K8s temp data dir
+                    event_filename == "..config.yaml") { // K8s uses this sometimes for the link
+                    
+                    Logger::smf_app().info(
+                        "Detected relevant event (mask=0x%x, name='%s') in config directory: %s", 
+                        event->mask, event_filename.c_str(), monitored_dir_path.c_str());
+                    trigger_reload = true;
+                } else if (event_filename.empty() && (event->mask & IN_CLOSE_WRITE)) {
+                    // CLOSE_WRITE on the directory itself (less common, but possible?)
+                    // Or maybe a direct write to the file without a filename in event?
+                    // Let's cautiously trigger a reload, but log it clearly.
+                     Logger::smf_app().warn(
+                        "Detected CLOSE_WRITE event with no filename in config directory: %s. Triggering reload.", 
+                        monitored_dir_path.c_str());
+                    trigger_reload = true;
+                }
+            }
+
+            if (trigger_reload) {
+                // Add a small delay to allow filesystem operations to settle, 
+                // especially after atomic symlink swaps.
+                usleep(100000); // 100ms delay
                 handle_config_change();
             } else if (event->mask & IN_IGNORED) {
                 // The watch was removed, perhaps the file was deleted or filesystem unmounted
                  Logger::smf_app().warn("inotify watch for %s ignored. Re-adding watch.", monitored_file_path.c_str());
-                 // Attempt to re-add the watch. This might fail if the file is permanently gone.
+                 // Attempt to re-add the watch. This might fail if the directory is gone.
                  inotify_rm_watch(fd, wd); // Remove the old watch descriptor explicitly
-                 wd = inotify_add_watch(fd, monitored_file_path.c_str(), IN_MODIFY | IN_CLOSE_WRITE);
+                 // Re-add the directory watch
+                 wd = inotify_add_watch(fd, monitored_dir_path.c_str(), 
+                                        IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE);
                  if (wd < 0) {
-                    Logger::smf_app().error("inotify_add_watch failed on re-attempt for %s: %s. Stopping monitor.", monitored_file_path.c_str(), strerror(errno));
+                    Logger::smf_app().error("inotify_add_watch failed on re-attempt for directory %s: %s. Stopping monitor.", 
+                                           monitored_dir_path.c_str(), strerror(errno));
                     goto cleanup; // Exit thread if re-adding fails
                  }
             }
@@ -126,6 +181,7 @@ void handle_config_change() {
 
         // Attempt reload and get DNN changes
         std::map<std::string, oai::config::smf::DnnChange> dnn_changes = config_ptr->reload_config();
+        Logger::smf_app().info("Reload attempt finished. Detected %ld DNN changes.", dnn_changes.size());
 
         // Check if reload succeeded (reload_config returns empty map on failure)
         // We assume here that even if dnn_changes is empty, the reload might have succeeded
@@ -147,8 +203,15 @@ void handle_config_change() {
                 if (smf_app_inst) {
                     Logger::smf_app().info("Triggering propagation of %ld DNN changes.", dnn_changes.size());
                     smf_app_inst->trigger_dnn_updates(dnn_changes);
+                    Logger::smf_app().info("DNN change propagation triggered.");
+
+                    // Regenerate profile and update NRF registration
+                    Logger::smf_app().info("Regenerating SMF profile after DNN changes.");
+                    smf_app_inst->generate_smf_profile();
+                    smf_app_inst->trigger_nrf_profile_update();
+
                 } else {
-                    Logger::smf_app().error("smf_app_inst is null. Cannot trigger DNN updates.");
+                    Logger::smf_app().error("smf_app_inst is null. Cannot trigger DNN updates or NRF profile update.");
                 }
             } else {
                  Logger::smf_app().info("No DNN changes detected needing propagation.");

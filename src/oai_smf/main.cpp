@@ -29,6 +29,7 @@
 #include "smf-http2-server.h"
 #include "sbi_helper.hpp"
 #include "http_client.hpp"
+#include "config_monitor.hpp"
 
 #include <iostream>
 #include <thread>
@@ -165,6 +166,13 @@ int main(int argc, char** argv) {
 
   // SMF application layer
   smf_app_inst = new smf_app(Options::getlibconfigConfig());
+
+  // Start the configuration file monitor thread
+  if (!oai::config::start_config_monitor_thread(Options::getlibconfigConfig(), smf_cfg.get())) {
+      Logger::system().error("Failed to start configuration monitor thread. Configuration changes will not be automatically loaded.");
+      // Decide if this is a fatal error or just a warning
+      // return 1; // Example: exit if monitoring fails
+  }
 
   // PID file
   // Currently hard-coded value. TODO: add as config option.

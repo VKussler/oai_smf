@@ -2513,4 +2513,67 @@ void smf_app::trigger_dnn_updates(const std::map<std::string, oai::config::smf::
     Logger::smf_app().debug("Exiting trigger_dnn_updates().");
 }
 
-//} // namespace smf
+void smf_app::trigger_nrf_profile_update() {
+    if (!smf_cfg->register_nrf()) {
+        Logger::smf_app().info("NRF registration is disabled, skipping profile update.");
+        return;
+    }
+
+    Logger::smf_app().info("Triggering NRF profile update.");
+
+    // Ensure the profile is up-to-date (might have been called already, but safe to call again)
+    // generate_smf_profile(); // Called externally now before this function
+
+    std::shared_ptr<itti_n11_update_nf_instance_request> itti_msg =
+        std::make_shared<itti_n11_update_nf_instance_request>(
+            TASK_SMF_APP, TASK_SMF_SBI);
+
+    // Create JSON Patch to replace the smfInfo
+    oai::model::common::PatchItem patch_item = {};
+    oai::model::common::PatchOperation op;
+    op.setEnumValue(oai::model::common::PatchOperation_anyOf::ePatchOperation_anyOf::REPLACE);
+    patch_item.setOp(op);
+    patch_item.setPath("/smfInfo"); // Path according to NRF API for NFProfile
+
+    // Get the current SmfInfo from the profile structure (using the correct method)
+    oai::common::sbi::smf_info_t common_smf_info;
+    nf_instance_profile.get_smf_info(common_smf_info);
+
+    // Manually convert common_smf_info (3gpp_29.510.h) to model SmfInfo (model/nrf/SmfInfo.h)
+    oai::model::nrf::SmfInfo model_smf_info;
+    std::vector<oai::model::nrf::SnssaiSmfInfoItem> snssai_info_list;
+    for (const auto& common_snssai_item : common_smf_info.snssai_smf_info_list) {
+        oai::model::nrf::SnssaiSmfInfoItem model_snssai_item;
+        model_snssai_item.setSNssai(common_snssai_item.snssai.to_model_snssai()); // Use existing conversion
+        
+        std::vector<oai::model::nrf::DnnSmfInfoItem> dnn_info_list;
+        for (const auto& common_dnn_item : common_snssai_item.dnn_smf_info_list) {
+            oai::model::nrf::DnnSmfInfoItem model_dnn_item;
+            model_dnn_item.setDnn(common_dnn_item.dnn);
+            dnn_info_list.push_back(model_dnn_item);
+        }
+        model_snssai_item.setDnnSmfInfoList(dnn_info_list);
+        snssai_info_list.push_back(model_snssai_item);
+    }
+    model_smf_info.setSNssaiSmfInfoList(snssai_info_list);
+
+    // Convert the *model* object to JSON (without namespace qualifier)
+    nlohmann::json smf_info_json;
+    // oai::model::nrf::to_json(smf_info_json, smf_info_model); 
+    to_json(smf_info_json, model_smf_info); // Corrected call
+    patch_item.setValue(smf_info_json);
+
+    itti_msg->patch_items.push_back(patch_item);
+    itti_msg->smf_instance_id = smf_instance_id; // Assumes smf_instance_id is correctly set
+    itti_msg->http_version    = smf_cfg->http_version;
+
+    Logger::smf_app().debug("Sending NRF profile update ITTI message.");
+    int ret = itti_inst->send_msg(itti_msg);
+    if (RETURNok != ret) {
+        Logger::smf_app().error(
+            "Could not send NRF profile update ITTI message (%s) to task TASK_SMF_SBI",
+            itti_msg->get_msg_name());
+    } else {
+        Logger::smf_app().info("NRF profile update ITTI message sent successfully.");
+    }
+}

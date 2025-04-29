@@ -989,6 +989,11 @@ class smf_app {
    *                    if the DNN was ADDED, REMOVED, or MODIFIED.
    */
   void trigger_dnn_updates(const std::map<std::string, oai::config::smf::DnnChange>& dnn_changes);
+
+  /**
+   * @brief Triggers an update request to the NRF with the current SMF profile.
+   */
+  void trigger_nrf_profile_update();
 };
 }  // namespace smf
 #include "smf_config.hpp"

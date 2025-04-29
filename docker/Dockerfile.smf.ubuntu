@@ -63,10 +63,10 @@ FROM oai-smf-base as oai-smf-builder
 # Copying source code
 COPY . /openair-smf
 # Building SMF
-# For parallel build use the following code: ./build_smf --clean --Verbose --build-type Release --jobs && \
+# For parallel build use the following code: ./build_smf --clean --Verbose --build-type Release --jobs && ,, --jobs is the important part for parallel \
 WORKDIR /openair-smf/build/scripts
 RUN ldconfig && \
-    ./build_smf --clean --Verbose --build-type Release && \
+    ./build_smf --clean --Verbose --build-type Release --jobs && \
     ldd /openair-smf/build/smf/build/smf && \
     mv /openair-smf/build/smf/build/smf /openair-smf/build/smf/build/oai_smf
 

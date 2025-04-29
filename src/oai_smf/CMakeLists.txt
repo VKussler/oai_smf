@@ -318,6 +318,7 @@ add_executable(smf
   ${SRC_TOP_DIR}/oai_smf/options.cpp
   ${SRC_TOP_DIR}/itti/itti.cpp
   ${SRC_TOP_DIR}/itti/itti_msg.cpp
+  ${SRC_TOP_DIR}/oai_smf/config_monitor.cpp
   )
 
 include(${SRC_TOP_DIR}/${MOUNTED_COMMON}/logger/logger.cmake)
