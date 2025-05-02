@@ -358,6 +358,9 @@ smf_app::smf_app(const std::string& config_file)
 
   apply_config();
 
+  // Generate the unique NF Instance ID for this SMF instance at startup
+  generate_uuid(); 
+
   if (itti_inst->create_task(TASK_SMF_APP, smf_app_task, nullptr)) {
     Logger::smf_app().error("Cannot create task TASK_SMF_APP");
     throw std::runtime_error("Cannot create task TASK_SMF_APP");
@@ -2254,9 +2257,9 @@ void smf_app::generate_smf_profile() {
 
   nf_instance_profile = smf_profile();
 
-  // generate UUID
-  generate_uuid();
-  nf_instance_profile.set_nf_instance_id(smf_instance_id);
+  // generate UUID - REMOVED: UUID should be generated only once at startup
+  // generate_uuid(); 
+  nf_instance_profile.set_nf_instance_id(smf_instance_id); // Use existing ID
   nf_instance_profile.set_nf_instance_name("OAI-SMF");
   nf_instance_profile.set_nf_type("SMF");
   nf_instance_profile.set_nf_status("REGISTERED");
@@ -2476,20 +2479,20 @@ void smf_app::trigger_dnn_updates(const std::map<std::string, oai::config::smf::
             else release_count_modified++;
          }
          Logger::smf_app().info("Triggering release for %u sessions (Removed: %u, Modified: %u).", 
-                              sessions_to_release.size(), release_count_removed, release_count_modified);
+                              (unsigned int)sessions_to_release.size(), release_count_removed, release_count_modified);
          
          for (const auto& session_info : sessions_to_release) {
             // Unpack the tuple including the change type
-            const auto& [supi, pdu_id, dnn, snssai, reason] = session_info;
-            const char* reason_str = (reason == oai::config::smf::DnnChange::REMOVED) ? "REMOVED" : "MODIFIED";
+            const auto& [supi, pdu_id, dnn, snssai, change_type] = session_info;
+            const char* reason_str = (change_type == oai::config::smf::DnnChange::REMOVED) ? "REMOVED" : "MODIFIED";
 
             Logger::smf_app().info("--> Triggering release procedure for SUPI: %s, PDU ID: %d, DNN: %s (Reason: DNN %s)",
                                    smf_supi_to_string(supi).c_str(), pdu_id, dnn.c_str(), reason_str);
 
             // Construct and send itti_n11_release_sm_context_request internally
-            // Revert constructor call
             // Use constructor with promise_id = 0 for internal trigger
-            auto release_req_msg = std::make_shared<itti_n11_release_sm_context_request>(TASK_SMF_APP, TASK_SMF_APP, 0);
+            // Target TASK_SMF_SBI to send request over N11 interface
+            auto release_req_msg = std::make_shared<itti_n11_release_sm_context_request>(TASK_SMF_APP, TASK_SMF_SBI, 0); 
 
             release_req_msg->req.set_supi(supi);
             release_req_msg->req.set_pdu_session_id(pdu_id);
@@ -2507,9 +2510,20 @@ void smf_app::trigger_dnn_updates(const std::map<std::string, oai::config::smf::
                 Logger::smf_app().error("Failed to send internal release ITTI message for SUPI %s, PDU ID %d", smf_supi_to_string(supi).c_str(), pdu_id);
             }
          }
+    } else {
+         Logger::smf_app().info("No existing sessions affected by DNN changes.");
+    }
+    
+    // --- Trigger NRF update after handling sessions ---
+    if (smf_cfg->register_nrf()) { // Check if NRF registration is enabled
+        Logger::smf_app().info("DNN configuration changed, triggering NRF profile update.");
+        // Regenerate profile with current config and then trigger update request
+        generate_smf_profile(); 
+        trigger_nrf_profile_update(); 
+    } else {
+         Logger::smf_app().debug("NRF registration is disabled, skipping profile update.");
     }
 
-    // Modification logic is removed as MODIFIED triggers release now.
     Logger::smf_app().debug("Exiting trigger_dnn_updates().");
 }
 
